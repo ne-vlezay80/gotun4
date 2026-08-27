@@ -1,18 +1,24 @@
 //go:build linux
 
-// L3/L2 туннель поверх TCP с кадрированием «2 байта big-endian длины».
+// L3/L2 туннель поверх TCP.
 //
-// ⚠️ Трафик НЕ шифруется и НЕ аутентифицируется: любой, кто откроет TCP-соединение
-// с сервером, сможет инжектировать произвольные IP-пакеты в TUN и читать исходящий
-// трафик. Только для доверенных сетей/экспериментов либо под WireGuard/mTLS сверху.
+// Формат кадра:
 //
-// Пакеты, приходящие в TUN при отсутствии активного соединения, отбрасываются.
+//	[флаги u8][длина BE16][нагрузка]
 //
-// Настройка (пример):
-//	sudo ip addr add 10.66.66.1/30 dev tun0 && sudo ip link set tun0 up  # сервер
-//	sudo ip addr add 10.66.66.2/30 dev tun0 && sudo ip link set tun0 up  # клиент
-//	+ маршруты на нужные подсети. MTU программа выставляет сама (флаг -mtu,
-//	по умолчанию 1400 — компенсация оверхеда IP/TCP, чтобы не ломать PMTUD).
+//	флаг 0x01 = FIRST, 0x02 = LAST; целому пакету в одном куске соответствуют оба.
+//
+// Флаг -chunk N включает дробление исходящих пакетов на куски ≤ N:
+// первый кусок помечается FIRST, последний LAST. Принимающая сторона
+// собирает пакет до записи в TUN, поэтому её -chunk может отличаться.
+// Максимальный размер собранного пакета и одного куска — 65535 байт.
+//
+// ⚠️ Трафик НЕ шифруется и НЕ аутентифицируется. Только доверенные сети.
+// ⚠️ Обе стороны должны быть собраны из одной версии программы.
+//
+// Настройка:
+//	sudo ip addr add 10.66.66.1/30 dev tun0 && sudo ip link set tun0 up
+//	MTU выставляется автоматически (-mtu, по умолчанию 1400).
 package main
 
 import (
@@ -30,43 +36,45 @@ import (
     "unsafe"
 )
 
-// Константы из заголовочных файлов Linux
 const (
-    TUNSETIFF   = 0x400454ca
-    SIOCSIFMTU  = 0x8922
-    IFF_TUN     = 0x0001
-    IFF_TAP     = 0x0002
-    IFF_NO_PI   = 0x1000
-    IFF_PERSIST = 0x0800
-)
+    TUNSETIFF  = 0x400454ca
+    SIOCSIFMTU = 0x8922
+    IFF_TUN    = 0x0001
+    IFF_TAP    = 0x0002
+    IFF_NO_PI  = 0x1000
+    IFF_PERSIST = 0x0800 
 
-// Лимит накладывает 2-байтовый префикс длины
-const maxFrameSize = 65535
+    flagFirst     = 0x01
+    flagLast      = 0x02
+    validFlags    = flagFirst | flagLast
+    chunkHdrSize  = 3
+    maxPacketSize = 65535 // предел длины куска (u16) и собранного пакета
+)
 
 // ifReq повторяет struct ifreq ядра Linux: sizeof = 40 байт на LP64 (amd64/arm64).
 type ifReq struct {
     Name  [16]byte
     Flags uint16
-    _     [22]byte // добор до 40 байт: 16 (имя) + 24 (union, максимум — struct ifmap)
+    _     [22]byte
 }
 
-// ifReqMTU — та же структура, но с заполненным полем ifru_mtu (int).
+// ifReqMTU — та же структура с заполненным полем ifru_mtu (int).
 type ifReqMTU struct {
     Name [16]byte
     MTU  int32
-    _    [20]byte // итого 40 байт
+    _    [20]byte
 }
 
-// TcpConfig хранит настройки TCP
-type TcpConfig struct {
+// Config — все настройки туннеля.
+type Config struct {
     NoDelay    bool
     KeepAlive  bool
     RxBufferMB int
     TxBufferMB int
+    ChunkSize  int // ≤0 — не дробить; иначе куски ≤ ChunkSize (сжимается до 65535)
 }
 
 // SafeConn защищает доступ к текущему соединению.
-// Инвариант: данные в TCP пишет единственная горутина (ниже в main).
 type SafeConn struct {
     mu   sync.RWMutex
     conn net.Conn
@@ -84,7 +92,6 @@ func (s *SafeConn) Store(c net.Conn) {
     s.mu.Unlock()
 }
 
-// TryStore сохраняет c, если слот свободен; false — если уже занят.
 func (s *SafeConn) TryStore(c net.Conn) bool {
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -95,8 +102,6 @@ func (s *SafeConn) TryStore(c net.Conn) bool {
     return true
 }
 
-// ClearIfCurrent сбрасывает слот, только если там ещё лежит old
-// (защита от гонки при замене соединения на новое).
 func (s *SafeConn) ClearIfCurrent(old net.Conn) {
     s.mu.Lock()
     if s.conn == old {
@@ -105,10 +110,7 @@ func (s *SafeConn) ClearIfCurrent(old net.Conn) {
     s.mu.Unlock()
 }
 
-// backoff — экспоненциальная задержка переподключения с потолком.
-type backoff struct {
-    d time.Duration
-}
+type backoff struct{ d time.Duration }
 
 func (b *backoff) next() time.Duration {
     if b.d == 0 {
@@ -129,21 +131,28 @@ func main() {
     tunName := flag.String("tun", "tun0", "Имя TUN интерфейса")
     tunMode := flag.String("tunmode", "tun", "Режим TUN интерфейса (tun/tap)")
     addr := flag.String("addr", "127.0.0.1:1080", "Адрес подключения/прослушивания")
-    mtu := flag.Int("mtu", 1400, "MTU интерфейса (компенсирует оверхед IP/TCP; <=0 — не менять)")
-    persist := flag.Bool("persist", true, "Оставлять интерфейс после завершения процесса (IFF_PERSIST)")
+    mtu := flag.Int("mtu", 1400, "MTU интерфейса (<=0 — не менять)")
+    persist := flag.Bool("persist", false, "Оставлять интерфейс после выхода (IFF_PERSIST)")
+    chunk := flag.Int("chunk", 1400, "Размер куска при дроблении пакетов, байт (<=0 — без дробления)")
 
     tcpnodelay := flag.Bool("nodelay", true, "Управление флагом TCP_NODELAY")
     tcpkeepalive := flag.Bool("keepalive", true, "Управление флагом TCP_KEEPALIVE")
-    tcprxbuf := flag.Int("rxbuf", 32, "Размер входящего буфера TCP в МБ")
-    tcptxbuf := flag.Int("txbuf", 32, "Размер исходящего буфера TCP в МБ")
+    tcprxbuf := flag.Int("rxbuf", 32, "Входящий буфер TCP в МБ")
+    tcptxbuf := flag.Int("txbuf", 32, "Исходящий буфер TCP в МБ")
 
     flag.Parse()
 
-    cfg := &TcpConfig{
+    cfg := &Config{
         NoDelay:    *tcpnodelay,
         KeepAlive:  *tcpkeepalive,
         RxBufferMB: *tcprxbuf,
         TxBufferMB: *tcptxbuf,
+        ChunkSize:  *chunk,
+    }
+    switch {
+    case cfg.ChunkSize > maxPacketSize:
+        log.Printf("-chunk %d больше максимума (%d), ограничен", cfg.ChunkSize, maxPacketSize)
+        cfg.ChunkSize = maxPacketSize
     }
 
     ifce, err := openTun(*tunName, *tunMode == "tap", *persist)
@@ -160,41 +169,37 @@ func main() {
         }
     }
 
+    if cfg.ChunkSize > 0 {
+        log.Printf("Дробление пакетов включено: куски до %d байт", cfg.ChunkSize)
+    } else {
+        log.Printf("Дробление выключено: пакет = один кадр")
+    }
+
     state := &SafeConn{}
 
-    // Поток отправки (TUN -> TCP). Один буфер на всё время жизни горутины.
+    // Поток отправки (TUN -> TCP).
     go func() {
-        buf := make([]byte, maxFrameSize+2)
+        buf := make([]byte, chunkHdrSize+maxPacketSize) // + место под 3-байтовый заголовок
         for {
-            n, err := ifce.Read(buf[2:])
+            n, err := ifce.Read(buf[chunkHdrSize:])
             if err != nil {
-                // Закрытый fd даёт *fs.PathError, оборачивающий os.ErrClosed,
-                // поэтому нужно именно errors.Is, а не прямое сравнение.
+                // Закрытый fd даёт *fs.PathError вокруг os.ErrClosed — нужно errors.Is.
                 if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
                     return
                 }
-                // Пауза против горячего цикла при персистентной ошибке чтения.
-                time.Sleep(10 * time.Millisecond)
+                time.Sleep(10 * time.Millisecond) // против горячего цикла
                 continue
             }
             if n == 0 {
                 continue
             }
-            if n > maxFrameSize {
-                log.Printf("Кадр %d байт превышает лимит %d — отброшен", n, maxFrameSize)
-                continue
-            }
 
             conn := state.Get()
             if conn == nil {
-                continue // нет активного TCP-соединения — пакет отбрасываем
+                continue // нет активного соединения — пакет отбрасываем
             }
 
-            binary.BigEndian.PutUint16(buf[:2], uint16(n))
-            // (*net.TCPConn).Write либо записывает весь slice, либо возвращает
-            // ошибку — цикл дозаписи не нужен.
-            if _, err := conn.Write(buf[:2+n]); err != nil {
-                log.Printf("Ошибка отправки в TCP: %v", err)
+            if !emitChunks(conn, buf, n, cfg.effectiveChunk()) {
                 state.ClearIfCurrent(conn)
                 conn.Close()
             }
@@ -209,6 +214,56 @@ func main() {
     default:
         log.Fatal("Неизвестный режим: ", *mode)
     }
+}
+
+// effectiveChunk возвращает рабочий лимит куска; <=0 означает «не дробить»,
+// что эквивалентно лимиту maxPacketSize.
+func (c *Config) effectiveChunk() int {
+    if c.ChunkSize <= 0 || c.ChunkSize > maxPacketSize {
+        return maxPacketSize
+    }
+    return c.ChunkSize
+}
+
+// emitChunks пишет пакет длиной n из buf как кадры с заголовками
+// [флаги][длина BE16], соблюдая FIRST/LAST. Возвращает false при ошибке записи.
+//
+// Буфер устроен так: пакет лежит с offset 3, поэтому первый кусок уже
+// расположен подряд с заголовком — он уходит одним Write без копирования.
+// Последующие куски сдвигаются copy() в начало области нагрузки
+// (copy безопасно работает с перекрывающимися областями).
+func emitChunks(conn net.Conn, buf []byte, n, chunkLimit int) bool {
+    var (
+        off int
+        f   byte
+    )
+    for off < n {
+        seg := chunkLimit
+        if rest := n - off; rest < seg {
+            seg = rest
+        }
+        payload := buf[chunkHdrSize : chunkHdrSize+seg]
+        if off > 0 {
+            copy(payload, buf[chunkHdrSize+off:chunkHdrSize+off+seg])
+        }
+
+        f = 0
+        if off == 0 {
+            f |= flagFirst
+        }
+        if off+seg == n {
+            f |= flagLast
+        }
+        buf[0] = f
+        binary.BigEndian.PutUint16(buf[1:3], uint16(seg))
+
+        if _, err := conn.Write(buf[:chunkHdrSize+seg]); err != nil {
+            log.Printf("Ошибка отправки в TCP: %v", err)
+            return false
+        }
+        off += seg
+    }
+    return true
 }
 
 func openTun(name string, isTAP bool, wantPersist bool) (*os.File, error) {
@@ -279,7 +334,7 @@ func setInterfaceMTU(name string, mtu int) error {
     return nil
 }
 
-func runServer(ifce *os.File, addr string, state *SafeConn, cfg *TcpConfig) {
+func runServer(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
     listener, err := net.Listen("tcp", addr)
     if err != nil {
         log.Fatalf("Ошибка запуска сервера: %v", err)
@@ -308,7 +363,7 @@ func runServer(ifce *os.File, addr string, state *SafeConn, cfg *TcpConfig) {
     }
 }
 
-func runClient(ifce *os.File, addr string, state *SafeConn, cfg *TcpConfig) {
+func runClient(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
     bo := backoff{}
     for {
         log.Printf("Клиент подключается к %s...", addr)
@@ -328,16 +383,22 @@ func runClient(ifce *os.File, addr string, state *SafeConn, cfg *TcpConfig) {
     }
 }
 
-func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *TcpConfig) {
+// Состояние сборщика пакетов.
+const (
+    stIdle     = iota // ждём FIRST
+    stAssemble        // копим куски до LAST
+)
+
+func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Config) {
     applyTCPSettings(tcpConn, cfg)
 
-    // Буферизованный ридер: один recv() забирает сразу несколько кадров
-    // вместо двух системных вызовов на пакет.
     const recvBufSize = 256 << 10
     r := bufio.NewReaderSize(tcpConn, recvBufSize)
 
-    frame := make([]byte, maxFrameSize)
-    var lenPrefix [2]byte
+    frame := make([]byte, maxPacketSize)     // буфер для одиночных кусков
+    var acc []byte                            // ленивый аккумулятор для многокусковых пакетов
+    var hdr [chunkHdrSize]byte
+    mode := stIdle
 
     defer func() {
         state.ClearIfCurrent(tcpConn)
@@ -345,39 +406,93 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Tcp
         log.Println("Обработчик соединения завершён")
     }()
 
-    log.Println("Туннель запущен. Фрейминг 2 байта включен.")
+    writeToTun := func(p []byte) bool {
+        if _, err := ifce.Write(p); err != nil {
+            log.Printf("Ошибка записи в TUN: %v", err)
+            return false
+        }
+        return true
+    }
 
+    log.Println("Туннель запущен. Фрейминг: [флаги u8][длина BE16][нагрузка].")
+    readLoop:
     for {
-        if _, err := io.ReadFull(r, lenPrefix[:]); err != nil {
+        if _, err := io.ReadFull(r, hdr[:]); err != nil {
             if !errors.Is(err, io.EOF) {
-                log.Printf("Ошибка чтения длины кадра: %v", err)
+                log.Printf("Ошибка чтения заголовка: %v", err)
             }
             break
         }
+        flags := hdr[0]
+        flen := int(binary.BigEndian.Uint16(hdr[1:3]))
 
-        frameLen := binary.BigEndian.Uint16(lenPrefix[:])
-        // uint16 не бывает > 65535, поэтому осмысленная проверка — на ноль:
-        // признак рассинхронизации протокола или кривого клиента.
-        if frameLen == 0 {
-            log.Println("Кадр нулевой длины — рассинхронизация протокола, разрыв соединения")
+        if flen == 0 {
+            log.Println("Кадр нулевой длины — рассинхронизация протокола, разрыв")
+            break
+        }
+        if flags &^ validFlags != 0 {
+            log.Printf("Недопустимые биты флагов %#02x — рассинхронизация или чужой клиент, разрыв", flags)
             break
         }
 
-        if _, err := io.ReadFull(r, frame[:frameLen]); err != nil {
-            log.Printf("Ошибка чтения тела кадра: %v", err)
-            break
-        }
+        switch mode {
+        case stIdle:
+            if flags&flagFirst == 0 {
+                log.Printf("Кусок без FIRST в состоянии IDLE (len=%d, flags=%#02x) — разрыв", flen, flags)
+                break readLoop
+            }
 
-        // Ядро принимает ровно один пакет за write() в TUN, а Go гарантирует
-        // полную запись до ошибки.
-        if _, err := ifce.Write(frame[:frameLen]); err != nil {
-            log.Printf("Ошибка записи в TUN: %v", err)
-            break
+            if flags&flagLast != 0 {
+                // Быстрый путь: целый пакет одним куском, без сборки.
+                if _, err := io.ReadFull(r, frame[:flen]); err != nil {
+                    log.Printf("Ошибка чтения тела пакета: %v", err)
+                    return
+                }
+                if !writeToTun(frame[:flen]) {
+                    return
+                }
+                continue
+            }
+
+            // Первый кусок составного пакета — начинаем накопление.
+            if acc == nil {
+                acc = make([]byte, 0, maxPacketSize)
+            }
+            acc = acc[:0]
+            acc = acc[:flen]
+            if _, err := io.ReadFull(r, acc); err != nil {
+                log.Printf("Ошибка чтения первого куска: %v", err)
+                return
+            }
+            mode = stAssemble
+
+        case stAssemble:
+            if flags&flagFirst != 0 {
+                log.Println("Новый FIRST посреди незавершённого пакета — разрыв")
+                return
+            }
+            base := len(acc)
+            if base+flen > maxPacketSize {
+                log.Printf("Собранный пакет превысил лимит %d байт — разрыв", maxPacketSize)
+                return
+            }
+            acc = acc[:base+flen]
+            if _, err := io.ReadFull(r, acc[base:]); err != nil {
+                log.Printf("Ошибка чтения куска: %v", err)
+                return
+            }
+
+            if flags&flagLast != 0 {
+                if !writeToTun(acc) {
+                    return
+                }
+                mode = stIdle
+            }
         }
     }
 }
 
-func applyTCPSettings(conn net.Conn, cfg *TcpConfig) {
+func applyTCPSettings(conn net.Conn, cfg *Config) {
     tcp, ok := conn.(*net.TCPConn)
     if !ok {
         return
@@ -385,7 +500,6 @@ func applyTCPSettings(conn net.Conn, cfg *TcpConfig) {
     tcp.SetNoDelay(cfg.NoDelay)
     tcp.SetKeepAlive(cfg.KeepAlive)
     if cfg.KeepAlive {
-        // Фиксируем период явно, не полагаясь на дефолты рантайма.
         tcp.SetKeepAlivePeriod(15 * time.Second)
     }
     if mb := cfg.RxBufferMB * 1024 * 1024; mb > 0 {
