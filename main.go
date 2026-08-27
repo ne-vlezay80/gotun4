@@ -8,28 +8,40 @@
 //	payLen  — сколько из них реальные данные (payLen <= wireLen).
 //	флаги: 0x01 = FIRST, 0x02 = LAST; FIRST|LAST — целый пакет одним кадром.
 //
-// Кадрирование (-chunk):
-//	N  > 0: каждый кадр несёт ровно N байт провода; данные добиваются
-//	        до N или режутся на куски. Стороны могут иметь разные N.
-//	N <= 0: кадры переменной длины, без дробления.
+// Кадрирование (-chunk, -chunktx, -chunkrx). Размер кадра на проводе
+// определяет ОТПРАВИТЕЛЬ:
 //
-// Шейпер (-delay/-jitter): задерживает выдачу каждого пакета (целиком,
-// порядок кусков внутри пакета сохранён) на delay + равномерный джиттер
-// [0, jitter). Применяется отдельно к каждому направлению, поэтому RTT
-// вырастает примерно на 2*delay. Очередь шейпера ограничена по байтам
-// (-shapebuf), переполнение = tail-drop.
+//	-chunktx N: наши кадры несут ровно N байт провода — данные добиваются
+//	            до N или режутся на куски; N <= 0 — переменная длина.
+//	-chunkrx N: от пира ожидается кадр ровно N байт; иная длина — разрыв
+//	            (защита от рассинхрона конфигураций); N <= 0 — приём без
+//	            контроля размера.
+//	-chunk задаёт сразу оба направления; явно заданные -chunktx/-chunkrx
+//	переопределяют своё направление (в т.ч. нулём — «выключить»).
+//	Асимметричный канал задаётся зеркальными конфигурациями:
+//	    A: -chunktx 600  -chunkrx 1400
+//	    B: -chunktx 1400 -chunkrx 600    (A->B кадры 600, B->A кадры 1400)
 //
-// Паддинг (-padmode): чем заполняется область добивки в фиксированных
-// кадрах — нулями или криптосткойкой псевдослучайностью (ChaCha8).
-// Это маскировка slack-области, а НЕ шифрование: длины кадров и тайминги
-// остаются открытыми.
+// Паддинг (-padmode): чем заполняется slack-область фиксированных кадров —
+// нулями или криптостойкой псевдослучайностью (ChaCha8). Это маскировка
+// slack-области, а НЕ шифрование: длины кадров и тайминги остаются открытыми.
+//
+// Шейпер (-delaytx/-jittertx, -delayrx/-jitterrx; -delay/-jitter — оба
+// направления сразу): задерживает выдачу каждого пакета (целиком, порядок
+// кусков внутри пакета сохранён) на delay + равномерный джиттер [0, jitter).
+// Шейперы TX и RX независимы (можно включить только одно направление).
+// Односторонняя задержка A->B = delaytx(A) + delayrx(B). Очередь каждого
+// шейпера ограничена по байтам (-shapebuf, на направление), переполнение =
+// tail-drop. Учёт памяти ведётся по реальному размеру буферов очереди.
 //
 // Многопроцессорность: рантайм Go сам использует все ядра; флаг -procs
 // позволяет лишь явно ограничить параллелизм (GOMAXPROCS).
 //
 // Ошибки TUN (интерфейс down) НЕ разрывают TCP: пакеты молча дропаются,
 // поток возобновляется автоматически. Разрыв — только ошибка TCP или
-// нарушение протокола.
+// нарушение протокола (в т.ч. кадр не того размера при -chunkrx > 0).
+//
+// Требуется Go >= 1.23 (math/rand/v2, clear, SetKeepAliveConfig).
 //
 // ⚠️ Трафик НЕ шифруется и НЕ аутентифицируется. Только доверенные сети.
 package main
@@ -47,6 +59,7 @@ import (
     "net"
     "os"
     "runtime"
+    "strings"
     "sync"
     "syscall"
     "time"
@@ -54,12 +67,12 @@ import (
 )
 
 const (
-    TUNSETIFF   = 0x400454ca
-    SIOCSIFMTU  = 0x8922
-    IFF_TUN     = 0x0001
-    IFF_TAP     = 0x0002
-    IFF_NO_PI   = 0x1000
-    IFF_PERSIST = 0x0800
+    TUNSETIFF     = 0x400454ca
+    TUNSETPERSIST = 0x400454cb
+    SIOCSIFMTU    = 0x8922
+    IFF_TUN       = 0x0001
+    IFF_TAP       = 0x0002
+    IFF_NO_PI     = 0x1000
 
     flagFirst     = 0x01
     flagLast      = 0x02
@@ -67,6 +80,7 @@ const (
     frameHdrSize  = 5
     maxPacketSize = 65535
     dropLogPeriod = 10 * time.Second
+    maxShapeBufMB = 4096 // защита от переполнения при абсурдных значениях -shapebuf
 )
 
 // ifReq повторяет struct ifreq ядра Linux: sizeof = 40 байт на LP64.
@@ -87,9 +101,15 @@ type Config struct {
     KeepAlive  bool
     RxBufferMB int
     TxBufferMB int
-    ChunkSize  int
-    Delay      time.Duration
-    Jitter     time.Duration
+
+    ChunkTX int // размер кадров, которые МЫ отправляем; <=0 — переменная длина
+    ChunkRX int // ожидаемый размер кадров ОТ ПИРА; >0 — строгая проверка
+
+    DelayTX  time.Duration
+    JitterTX time.Duration
+    DelayRX  time.Duration
+    JitterRX time.Duration
+
     ShapeBufMB int
     PadMode    string // "zero" | "random"
 }
@@ -151,8 +171,8 @@ var pktPool = sync.Pool{
     New: func() any { return make([]byte, frameHdrSize+maxPacketSize) },
 }
 
-func getPkt() []byte    { return pktPool.Get().([]byte) }
-func putPkt(b []byte)   { pktPool.Put(b) }
+func getPkt() []byte  { return pktPool.Get().([]byte) }
+func putPkt(b []byte) { pktPool.Put(b) }
 
 // newPadFiller возвращает функцию заполнения области паддинга.
 // Режиму random соответствует один экземпляр ChaCha8, засеянный из
@@ -186,7 +206,7 @@ func newPadFiller(mode string) func([]byte) {
 type schedItem struct {
     at  time.Time
     pkt []byte // буфер из pktPool; владение переходит к out()
-    n   int    // размер полезной части (для учёта очереди)
+    sz  int    // cap(pkt) — реальный удерживаемый объём (для учёта очереди)
 }
 
 type schedQueue []schedItem
@@ -236,24 +256,30 @@ func newShaper(delay, jitter time.Duration, maxBytes int, out func([]byte, int))
 
 // Submit принимает владение pkt (буфер должен быть из pktPool).
 // Никогда не блокирует: при переполнении — tail-drop пакета.
+// Учёт ведётся по cap(pkt): элемент очереди удерживает ВЕСЬ буфер из пула
+// (frameHdrSize+maxPacketSize), а не только полезную нагрузку — иначе
+// очередь из мелких пакетов незаметно съедает на порядки больше лимита.
 func (s *shaper) Submit(pkt []byte, n int) {
     at := time.Now().Add(s.delay)
     if s.jitter > 0 {
         at = at.Add(time.Duration(mrand.Int64N(int64(s.jitter))))
     }
 
+    sz := cap(pkt)
+
     s.mu.Lock()
-    if s.bytes+n > s.maxBytes {
+    if s.bytes+sz > s.maxBytes {
         if time.Since(s.lastLog) >= dropLogPeriod {
             s.lastLog = time.Now()
-            log.Printf("Шейпер: очередь переполнена (%d/%d байт), пакет %d байт отброшен (tail-drop)", s.bytes, s.maxBytes, n)
+            log.Printf("Шейпер: очередь переполнена (%d/%d байт удержания), пакет %d байт (буфер %d) отброшен (tail-drop)",
+                s.bytes, s.maxBytes, n, sz)
         }
         s.mu.Unlock()
         putPkt(pkt)
         return
     }
-    s.bytes += n
-    heap.Push(&s.q, schedItem{at: at, pkt: pkt, n: n})
+    s.bytes += sz
+    heap.Push(&s.q, schedItem{at: at, pkt: pkt, sz: sz})
     s.mu.Unlock()
 
     select {
@@ -320,12 +346,19 @@ func (s *shaper) run() {
                 break
             }
             it := heap.Pop(&s.q).(schedItem)
-            s.bytes -= it.n
+            s.bytes -= it.sz
             s.mu.Unlock()
 
-            s.out(it.pkt, it.n)
+            s.out(it.pkt, it.n())
         }
     }
+}
+
+func (it schedItem) n() int {
+    // размер полезной части: pkt[0:5] — заголовок лежит вне полезной
+    // нагрузки, поэтому границы считаем в out(); здесь n не храним,
+    // чтобы не плодить дублирование. См. комментарий в out-колбэках.
+    return len(it.pkt) - frameHdrSize
 }
 
 func (s *shaper) drain() {
@@ -348,11 +381,23 @@ func main() {
     tunMode := flag.String("tunmode", "tun", "Режим TUN интерфейса (tun/tap)")
     addr := flag.String("addr", "127.0.0.1:1080", "Адрес подключения/прослушивания")
     mtu := flag.Int("mtu", 1400, "MTU интерфейса (<=0 — не менять)")
-    persist := flag.Bool("persist", false, "Оставлять интерфейс после выхода (IFF_PERSIST)")
-    chunk := flag.Int("chunk", 1400, "Фиксированный размер кадра: добивка/нарезка до N (<=(0) — переменная длина)")
+    persist := flag.Bool("persist", false, "Оставлять интерфейс после выхода (TUNSETPERSIST)")
 
-    delay := flag.Duration("delay", 0, "Базовая задержка НА НАПРАВЛЕНИЕ (RTT вырастет ~на 2x), например 50ms")
-    jitter := flag.Duration("jitter", 0, "Случайная добавка 0..jitter на направление (uniform)")
+    // Кадрирование: -chunk задаёт базу для обоих направлений,
+    // -chunktx/-chunkrx, заданные явно, переопределяют своё.
+    chunk := flag.Int("chunk", 1400, "Базовый размер кадра для обоих направлений; <=0 — переменная длина")
+    chunkTX := flag.Int("chunktx", 0, "Исходящие кадры (МЫ -> пир): N>0 — фиксированные с добивкой до N; по умолчанию как -chunk")
+    chunkRX := flag.Int("chunkrx", 0, "Входящие кадры (пир -> МЫ): N>0 — ожидается строго N, несовпадение = разрыв; <=0 — без контроля; по умолчанию как -chunk")
+
+    // Шейпер: -delay/-jitter задают базу для обоих направлений,
+    // -delaytx/-delayrx/..., заданные явно, переопределяют своё.
+    delay := flag.Duration("delay", 0, "Базовая задержка для обоих направлений")
+    jitter := flag.Duration("jitter", 0, "Случайная добавка 0..jitter для обоих направлений (uniform)")
+    delayTX := flag.Duration("delaytx", 0, "Задержка TUN->TCP; по умолчанию как -delay")
+    jitterTX := flag.Duration("jittertx", 0, "Джиттер TUN->TCP; по умолчанию как -jitter")
+    delayRX := flag.Duration("delayrx", 0, "Задержка TCP->TUN; по умолчанию как -delay")
+    jitterRX := flag.Duration("jitterrx", 0, "Джиттер TCP->TUN; по умолчанию как -jitter")
+
     shapebuf := flag.Int("shapebuf", 16, "Лимит очереди шейпера в МБ на направление")
     padmode := flag.String("padmode", "zero", "Заполнитель паддинга фиксированных кадров: zero|random")
     procs := flag.Int("procs", 0, "Ограничить число ядер (GOMAXPROCS); 0 — решение рантайма")
@@ -364,21 +409,52 @@ func main() {
 
     flag.Parse()
 
+    // Per-direction флаги действуют, только если заданы в командной строке:
+    // тогда они переопределяют базу (-chunk/-delay/-jitter), включая явный
+    // ноль («выключить фичу на этом направлении»).
+    set := map[string]bool{}
+    flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
     cfg := &Config{
         NoDelay:    *tcpnodelay,
         KeepAlive:  *tcpkeepalive,
         RxBufferMB: *tcprxbuf,
         TxBufferMB: *tcptxbuf,
-        ChunkSize:  *chunk,
-        Delay:      *delay,
-        Jitter:     *jitter,
+        ChunkTX:    *chunk,
+        ChunkRX:    *chunk,
+        DelayTX:    *delay,
+        JitterTX:   *jitter,
+        DelayRX:    *delay,
+        JitterRX:   *jitter,
         ShapeBufMB: *shapebuf,
         PadMode:    *padmode,
     }
+    if set["chunktx"] {
+        cfg.ChunkTX = *chunkTX
+    }
+    if set["chunkrx"] {
+        cfg.ChunkRX = *chunkRX
+    }
+    if set["delaytx"] {
+        cfg.DelayTX = *delayTX
+    }
+    if set["jittertx"] {
+        cfg.JitterTX = *jitterTX
+    }
+    if set["delayrx"] {
+        cfg.DelayRX = *delayRX
+    }
+    if set["jitterrx"] {
+        cfg.JitterRX = *jitterRX
+    }
 
-    if cfg.ChunkSize > maxPacketSize {
-        log.Printf("-chunk %d больше максимума (%d), ограничен", cfg.ChunkSize, maxPacketSize)
-        cfg.ChunkSize = maxPacketSize
+    if cfg.ChunkTX > maxPacketSize {
+        log.Printf("-chunktx %d больше максимума (%d), ограничен", cfg.ChunkTX, maxPacketSize)
+        cfg.ChunkTX = maxPacketSize
+    }
+    if cfg.ChunkRX > maxPacketSize {
+        log.Printf("-chunkrx %d больше максимума (%d), ограничен", cfg.ChunkRX, maxPacketSize)
+        cfg.ChunkRX = maxPacketSize
     }
     if cfg.PadMode != "zero" && cfg.PadMode != "random" {
         log.Printf("-padmode %q неизвестен, использую zero", cfg.PadMode)
@@ -387,6 +463,15 @@ func main() {
     if cfg.ShapeBufMB <= 0 {
         log.Printf("-shapebuf %d некорректен, использую 16 МБ", cfg.ShapeBufMB)
         cfg.ShapeBufMB = 16
+    } else if cfg.ShapeBufMB > maxShapeBufMB {
+        log.Printf("-shapebuf %d слишком велик, ограничен %d МБ", cfg.ShapeBufMB, maxShapeBufMB)
+        cfg.ShapeBufMB = maxShapeBufMB
+    }
+
+    tm := strings.ToLower(*tunMode)
+    if tm != "tun" && tm != "tap" {
+        log.Printf("-tunmode %q неизвестен, использую tun", *tunMode)
+        tm = "tun"
     }
 
     if *procs > 0 {
@@ -394,27 +479,33 @@ func main() {
         log.Printf("GOMAXPROCS: %d -> %d", prev, *procs)
     }
 
-    ifce, err := openTun(*tunName, *tunMode == "tap", *persist)
+    ifce, ifName, err := openTun(*tunName, tm == "tap", *persist)
     if err != nil {
         log.Fatalf("Ошибка создания TUN: %v", err)
     }
     defer ifce.Close()
 
     if *mtu > 0 {
-        if err := setInterfaceMTU(*tunName, *mtu); err != nil {
-            log.Printf("Предупреждение: не удалось выставить MTU=%d у %s: %v", *mtu, *tunName, err)
+        if err := setInterfaceMTU(ifName, *mtu); err != nil {
+            log.Printf("Предупреждение: не удалось выставить MTU=%d у %s: %v", *mtu, ifName, err)
         } else {
-            log.Printf("MTU интерфейса %s установлен в %d", *tunName, *mtu)
+            log.Printf("MTU интерфейса %s установлен в %d", ifName, *mtu)
         }
     }
 
-    if cfg.ChunkSize > 0 {
-        log.Printf("Кадры фиксированной длины: %d байт (+%d заголовок), паддинг: %s", cfg.ChunkSize, frameHdrSize, cfg.PadMode)
+    if cfg.ChunkTX > 0 {
+        log.Printf("Исходящие кадры: фиксированные %d байт (+%d заголовок), паддинг: %s", cfg.ChunkTX, frameHdrSize, cfg.PadMode)
     } else {
-        log.Println("Кадры переменной длины, без дробления")
+        log.Println("Исходящие кадры: переменной длины, без дробления")
     }
-    if cfg.Delay > 0 || cfg.Jitter > 0 {
-        log.Printf("Шейпер включён: delay=%s jitter=%s (на каждое направление, лимит очереди %d МБ)", cfg.Delay, cfg.Jitter, cfg.ShapeBufMB)
+    if cfg.ChunkRX > 0 {
+        log.Printf("Входящие кадры: ожидается ровно %d байт (несовпадение = разрыв)", cfg.ChunkRX)
+    } else {
+        log.Println("Входящие кадры: контроль размера выключен")
+    }
+    if cfg.DelayTX > 0 || cfg.JitterTX > 0 || cfg.DelayRX > 0 || cfg.JitterRX > 0 {
+        log.Printf("Шейпер: TX(delay=%s jitter=%s) RX(delay=%s jitter=%s); задержка A->B = delaytx(A)+delayrx(B); очередь %d МБ на направление",
+            cfg.DelayTX, cfg.JitterTX, cfg.DelayRX, cfg.JitterRX, cfg.ShapeBufMB)
     }
 
     state := &SafeConn{}
@@ -423,7 +514,7 @@ func main() {
     // Единая точка отправки в TCP (вызывается ТОЛЬКО из одной горутины:
     // либо цикл чтения TUN, либо диспетчер шейпера — одновременно никогда).
     sendOverTCP := func(conn net.Conn, pkt []byte, n int) {
-        ok := emitFrames(conn, pkt, n, cfg.ChunkSize, padFill)
+        ok := emitFrames(conn, pkt, n, cfg.ChunkTX, padFill)
         putPkt(pkt)
         if !ok {
             state.ClearIfCurrent(conn)
@@ -431,11 +522,11 @@ func main() {
         }
     }
 
-    // Исходящий шейпер. nil = выключен, прямой путь без копий.
-    shapeBytes := cfg.ShapeBufMB << 20
+    // Исходящий шейпер (TUN -> TCP): параметры TX-направления.
+    // nil = выключен, прямой путь без копий.
     var txShape *shaper
-    if cfg.Delay > 0 || cfg.Jitter > 0 {
-        txShape = newShaper(cfg.Delay, cfg.Jitter, shapeBytes, func(pkt []byte, n int) {
+    if cfg.DelayTX > 0 || cfg.JitterTX > 0 {
+        txShape = newShaper(cfg.DelayTX, cfg.JitterTX, cfg.ShapeBufMB<<20, func(pkt []byte, n int) {
             c := state.Get()
             if c == nil {
                 putPkt(pkt)
@@ -449,6 +540,7 @@ func main() {
     go func() {
         buf := make([]byte, frameHdrSize+maxPacketSize)
         for {
+            // n <= maxPacketSize гарантировано размером среза в Read.
             n, err := ifce.Read(buf[frameHdrSize:])
             if err != nil {
                 // Закрытый fd даёт *fs.PathError вокруг os.ErrClosed.
@@ -461,10 +553,6 @@ func main() {
             if n == 0 {
                 continue
             }
-            if n > maxPacketSize {
-                log.Printf("Пакет %d байт превышает максимум %d — отброшен", n, maxPacketSize)
-                continue
-            }
 
             conn := state.Get()
             if conn == nil {
@@ -473,7 +561,7 @@ func main() {
 
             if txShape == nil {
                 // Быстрый путь: пакет уже лежит за заголовком, без копий.
-                if !emitFrames(conn, buf, n, cfg.ChunkSize, padFill) {
+                if !emitFrames(conn, buf, n, cfg.ChunkTX, padFill) {
                     state.ClearIfCurrent(conn)
                     conn.Close()
                 }
@@ -545,20 +633,20 @@ func emitFrames(conn net.Conn, buf []byte, n, chunk int, fill func([]byte)) bool
     return true
 }
 
-func openTun(name string, isTAP bool, wantPersist bool) (*os.File, error) {
+func openTun(name string, isTAP bool, wantPersist bool) (*os.File, string, error) {
     fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR|syscall.O_CLOEXEC, 0)
     if err != nil {
-        return nil, err
+        return nil, "", err
     }
 
+    // ВАЖНО: IFF_PERSIST нельзя передавать в TUNSETIFF — ядро отвергает
+    // неизвестные биты с EINVAL (см. tun_set_iff в drivers/net/tun.c).
+    // Персистентность включается отдельным ioctl TUNSETPERSIST ниже.
     var flags uint16 = IFF_NO_PI
     if isTAP {
         flags |= IFF_TAP
     } else {
         flags |= IFF_TUN
-    }
-    if wantPersist {
-        flags |= IFF_PERSIST
     }
 
     var ifr ifReq
@@ -573,8 +661,25 @@ func openTun(name string, isTAP bool, wantPersist bool) (*os.File, error) {
     )
     if errno != 0 {
         syscall.Close(fd)
-        return nil, errno
+        return nil, "", errno
     }
+
+    if wantPersist {
+        // TUNSETPERSIST принимает значение напрямую, не указатель.
+        if _, _, errno := syscall.Syscall(
+            syscall.SYS_IOCTL,
+            uintptr(fd),
+            uintptr(TUNSETPERSIST),
+            1,
+        ); errno != 0 {
+            syscall.Close(fd)
+            return nil, "", errno
+        }
+    }
+
+    // Ядро записывает фактическое имя обратно в ifr.Name — важно для
+    // "tun%d", шаблонных или пустых имён: дальше используем именно его.
+    actual := strings.TrimRight(string(ifr.Name[:]), "\x00")
 
     kind := "TUN"
     if isTAP {
@@ -584,9 +689,9 @@ func openTun(name string, isTAP bool, wantPersist bool) (*os.File, error) {
     if wantPersist {
         extra = " (persist)"
     }
-    log.Printf("Открыт %s-интерфейс %q%s", kind, name, extra)
+    log.Printf("Открыт %s-интерфейс %q%s", kind, actual, extra)
 
-    return os.NewFile(uintptr(fd), kind+":"+name), nil
+    return os.NewFile(uintptr(fd), kind+":"+actual), actual, nil
 }
 
 func setInterfaceMTU(name string, mtu int) error {
@@ -688,11 +793,12 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
         }
     }
 
-    // Входной шейпер: после полной сборки пакет ждёт своего срока и
-    // внедряется в TUN. nil = прямой путь.
+    // Входной шейпер (TCP -> TUN): параметры RX-направления.
+    // После полной сборки пакет ждёт своего срока и внедряется в TUN.
+    // nil = прямой путь.
     var rxShape *shaper
-    if cfg.Delay > 0 || cfg.Jitter > 0 {
-        rxShape = newShaper(cfg.Delay, cfg.Jitter, cfg.ShapeBufMB<<20, func(pkt []byte, n int) {
+    if cfg.DelayRX > 0 || cfg.JitterRX > 0 {
+        rxShape = newShaper(cfg.DelayRX, cfg.JitterRX, cfg.ShapeBufMB<<20, func(pkt []byte, n int) {
             writeTun(pkt[:n])
             putPkt(pkt)
         })
@@ -725,7 +831,8 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
 readLoop:
     for {
         if _, err := io.ReadFull(r, hdr[:]); err != nil {
-            if !errors.Is(err, io.EOF) {
+            // EOF и частичный заголовок — штатное закрытие пира.
+            if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
                 log.Printf("Ошибка чтения заголовка: %v", err)
             }
             break
@@ -745,7 +852,19 @@ readLoop:
             break
         }
 
+        // Профиль входящих кадров: в фиксированном режиме пир обязан слать
+        // кадры ровно ChunkRX байт; иное — чужая/несовместимая конфигурация.
+        // Проверка ДО чтения тела — рассинхрон ловится дёшево.
+        if cfg.ChunkRX > 0 && wireLen != cfg.ChunkRX {
+            log.Printf("Кадр %d байт не совпадает с ожидаемым размером %d (-chunkrx) — разрыв", wireLen, cfg.ChunkRX)
+            break
+        }
+
         if _, err := io.ReadFull(r, frame[:wireLen]); err != nil {
+            // Обрыв посреди тела — тоже штатное закрытие соединения.
+            if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+                break
+            }
             log.Printf("Ошибка чтения тела кадра: %v", err)
             break
         }
@@ -785,7 +904,7 @@ readLoop:
             copy(acc[base:], payload)
 
             if flags&flagLast != 0 {
-                deliver(acc) // ← фикс: был deliver(acc, payLen) — обрезал пакет до последнего куска
+                deliver(acc) // размер — весь собранный пакет, не последний кусок
                 mode = stIdle
             }
         }
@@ -798,9 +917,15 @@ func applyTCPSettings(conn net.Conn, cfg *Config) {
         return
     }
     tcp.SetNoDelay(cfg.NoDelay)
-    tcp.SetKeepAlive(cfg.KeepAlive)
     if cfg.KeepAlive {
-        tcp.SetKeepAlivePeriod(15 * time.Second)
+        // SetKeepAlivePeriod объявлен deprecated с Go 1.23.
+        tcp.SetKeepAliveConfig(net.KeepAliveConfig{
+            Enable:   true,
+            Idle:     15 * time.Second,
+            Interval: 15 * time.Second,
+        })
+    } else {
+        tcp.SetKeepAlive(false)
     }
     if mb := cfg.RxBufferMB * 1024 * 1024; mb > 0 {
         tcp.SetReadBuffer(mb)
