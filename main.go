@@ -1,24 +1,27 @@
 //go:build linux
 
-// L3/L2 туннель поверх TCP.
+// L3/L2 туннель поверх TCP. Формат кадра v3:
 //
-// Формат кадра:
+//	[флаги u8][wireLen BE16][payLen BE16][wireLen байт данных]
 //
-//	[флаги u8][длина BE16][нагрузка]
+//	wireLen — сколько байт идёт за заголовком (включая паддинг),
+//	payLen  — сколько из них полезная нагрузка (всегда payLen <= wireLen).
+//	флаги: 0x01 = FIRST, 0x02 = LAST; FIRST|LAST — целый пакет одним кадром.
 //
-//	флаг 0x01 = FIRST, 0x02 = LAST; целому пакету в одном куске соответствуют оба.
+// Режимы:
 //
-// Флаг -chunk N включает дробление исходящих пакетов на куски ≤ N:
-// первый кусок помечается FIRST, последний LAST. Принимающая сторона
-// собирает пакет до записи в TUN, поэтому её -chunk может отличаться.
-// Максимальный размер собранного пакета и одного куска — 65535 байт.
+//	-chunk N (>0): фиксированные кадры. Каждый кадр несёт ровно N байт провода,
+//	    короткие данные дополняются нулями, длинные пакеты режутся на куски.
+//	    Значение -chunk на двух сторонах может отличаться.
+//	-chunk 0:      кадры переменной длины (wireLen == payLen), без дробления.
+//
+// Ошибки TUN (интерфейс down/недоступен) НЕ разрывают TCP-соединение:
+// пакеты отбрасываются, поток возобновляется автоматически при возврате
+// интерфейса. Разрыв происходит только при ошибке самого TCP или нарушении
+// протокола.
 //
 // ⚠️ Трафик НЕ шифруется и НЕ аутентифицируется. Только доверенные сети.
 // ⚠️ Обе стороны должны быть собраны из одной версии программы.
-//
-// Настройка:
-//	sudo ip addr add 10.66.66.1/30 dev tun0 && sudo ip link set tun0 up
-//	MTU выставляется автоматически (-mtu, по умолчанию 1400).
 package main
 
 import (
@@ -37,41 +40,40 @@ import (
 )
 
 const (
-    TUNSETIFF  = 0x400454ca
-    SIOCSIFMTU = 0x8922
-    IFF_TUN    = 0x0001
-    IFF_TAP    = 0x0002
-    IFF_NO_PI  = 0x1000
-    IFF_PERSIST = 0x0800 
+    TUNSETIFF   = 0x400454ca
+    SIOCSIFMTU  = 0x8922
+    IFF_TUN     = 0x0001
+    IFF_TAP     = 0x0002
+    IFF_NO_PI   = 0x1000
+    IFF_PERSIST = 0x0800
 
     flagFirst     = 0x01
     flagLast      = 0x02
     validFlags    = flagFirst | flagLast
-    chunkHdrSize  = 3
-    maxPacketSize = 65535 // предел длины куска (u16) и собранного пакета
+    frameHdrSize  = 5             // флаги + wireLen + payLen
+    maxPacketSize = 65535         // предел длины поля u16 и собранного пакета
+    dropLogPeriod = 10*time.Second // троттлинг лога отбрасываний
 )
 
-// ifReq повторяет struct ifreq ядра Linux: sizeof = 40 байт на LP64 (amd64/arm64).
+// ifReq повторяет struct ifreq ядра Linux: sizeof = 40 байт на LP64.
 type ifReq struct {
     Name  [16]byte
     Flags uint16
     _     [22]byte
 }
 
-// ifReqMTU — та же структура с заполненным полем ifru_mtu (int).
 type ifReqMTU struct {
     Name [16]byte
     MTU  int32
     _    [20]byte
 }
 
-// Config — все настройки туннеля.
 type Config struct {
     NoDelay    bool
     KeepAlive  bool
     RxBufferMB int
     TxBufferMB int
-    ChunkSize  int // ≤0 — не дробить; иначе куски ≤ ChunkSize (сжимается до 65535)
+    ChunkSize  int // >0 — фиксированные кадры размера N; <=0 — переменная длина
 }
 
 // SafeConn защищает доступ к текущему соединению.
@@ -133,7 +135,7 @@ func main() {
     addr := flag.String("addr", "127.0.0.1:1080", "Адрес подключения/прослушивания")
     mtu := flag.Int("mtu", 1400, "MTU интерфейса (<=0 — не менять)")
     persist := flag.Bool("persist", false, "Оставлять интерфейс после выхода (IFF_PERSIST)")
-    chunk := flag.Int("chunk", 1400, "Размер куска при дроблении пакетов, байт (<=0 — без дробления)")
+    chunk := flag.Int("chunk", 1400, "Фиксированный размер кадра: короткие пакеты добиваются до N, длинные режутся (<=(0) — переменная длина)")
 
     tcpnodelay := flag.Bool("nodelay", true, "Управление флагом TCP_NODELAY")
     tcpkeepalive := flag.Bool("keepalive", true, "Управление флагом TCP_KEEPALIVE")
@@ -149,8 +151,7 @@ func main() {
         TxBufferMB: *tcptxbuf,
         ChunkSize:  *chunk,
     }
-    switch {
-    case cfg.ChunkSize > maxPacketSize:
+    if cfg.ChunkSize > maxPacketSize {
         log.Printf("-chunk %d больше максимума (%d), ограничен", cfg.ChunkSize, maxPacketSize)
         cfg.ChunkSize = maxPacketSize
     }
@@ -170,27 +171,33 @@ func main() {
     }
 
     if cfg.ChunkSize > 0 {
-        log.Printf("Дробление пакетов включено: куски до %d байт", cfg.ChunkSize)
+        log.Printf("Кадры фиксированной длины: %d байт нагрузки (+%d заголовок)", cfg.ChunkSize, frameHdrSize)
     } else {
-        log.Printf("Дробление выключено: пакет = один кадр")
+        log.Println("Кадры переменной длины, без дробления и паддинга")
     }
 
     state := &SafeConn{}
 
     // Поток отправки (TUN -> TCP).
     go func() {
-        buf := make([]byte, chunkHdrSize+maxPacketSize) // + место под 3-байтовый заголовок
+        buf := make([]byte, frameHdrSize+maxPacketSize)
         for {
-            n, err := ifce.Read(buf[chunkHdrSize:])
+            n, err := ifce.Read(buf[frameHdrSize:])
             if err != nil {
-                // Закрытый fd даёт *fs.PathError вокруг os.ErrClosed — нужно errors.Is.
+                // Закрытый fd даёт *fs.PathError вокруг os.ErrClosed — нужен errors.Is.
                 if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
                     return
                 }
-                time.Sleep(10 * time.Millisecond) // против горячего цикла
+                // Интерфейс недоступен: пауза против горячего цикла,
+                // TCP-соединение при этом намеренно не трогаем.
+                time.Sleep(10 * time.Millisecond)
                 continue
             }
             if n == 0 {
+                continue
+            }
+            if n > maxPacketSize {
+                log.Printf("Кадр %d байт превышает максимум %d — отброшен (увеличьте -chunk)", n, maxPacketSize)
                 continue
             }
 
@@ -199,7 +206,8 @@ func main() {
                 continue // нет активного соединения — пакет отбрасываем
             }
 
-            if !emitChunks(conn, buf, n, cfg.effectiveChunk()) {
+            if !emitFrames(conn, buf, n, cfg.ChunkSize) {
+                // Соединение рвём только при ошибке самого TCP.
                 state.ClearIfCurrent(conn)
                 conn.Close()
             }
@@ -216,38 +224,29 @@ func main() {
     }
 }
 
-// effectiveChunk возвращает рабочий лимит куска; <=0 означает «не дробить»,
-// что эквивалентно лимиту maxPacketSize.
-func (c *Config) effectiveChunk() int {
-    if c.ChunkSize <= 0 || c.ChunkSize > maxPacketSize {
-        return maxPacketSize
-    }
-    return c.ChunkSize
-}
-
-// emitChunks пишет пакет длиной n из buf как кадры с заголовками
-// [флаги][длина BE16], соблюдая FIRST/LAST. Возвращает false при ошибке записи.
+// emitFrames пишет пакет длиной n (лежащий в buf с offset frameHdrSize) серией
+// кадров [флаги][wireLen][payLen][данные].
 //
-// Буфер устроен так: пакет лежит с offset 3, поэтому первый кусок уже
-// расположен подряд с заголовком — он уходит одним Write без копирования.
-// Последующие куски сдвигаются copy() в начало области нагрузки
-// (copy безопасно работает с перекрывающимися областями).
-func emitChunks(conn net.Conn, buf []byte, n, chunkLimit int) bool {
-    var (
-        off int
-        f   byte
-    )
-    for off < n {
-        seg := chunkLimit
-        if rest := n - off; rest < seg {
-            seg = rest
+// chunk > 0: каждый кадр занимает на проводе ровно chunk байт нагрузки;
+// область паддинга каждый раз очищается, чтобы в канал не утекали остатки
+// предыдущих пакетов. Последний кусок тоже добивается до полного размера.
+// chunk <= 0: wireLen == payLen, кадры переменной длины без дробления.
+//
+// Первый кусок отправляется одним Write без копирования (уже лежит за заголовком),
+// последующие сдвигаются copy() вперёд (copy безопасна для перекрывающихся областей).
+func emitFrames(conn net.Conn, buf []byte, n, chunk int) bool {
+    fixed := chunk > 0
+    for off := 0; off < n; {
+        seg := n - off
+        if fixed && seg > chunk {
+            seg = chunk
         }
-        payload := buf[chunkHdrSize : chunkHdrSize+seg]
-        if off > 0 {
-            copy(payload, buf[chunkHdrSize+off:chunkHdrSize+off+seg])
+        wireLen := seg
+        if fixed {
+            wireLen = chunk
         }
 
-        f = 0
+        f := byte(0)
         if off == 0 {
             f |= flagFirst
         }
@@ -255,9 +254,18 @@ func emitChunks(conn net.Conn, buf []byte, n, chunkLimit int) bool {
             f |= flagLast
         }
         buf[0] = f
-        binary.BigEndian.PutUint16(buf[1:3], uint16(seg))
+        binary.BigEndian.PutUint16(buf[1:3], uint16(wireLen))
+        binary.BigEndian.PutUint16(buf[3:5], uint16(seg))
 
-        if _, err := conn.Write(buf[:chunkHdrSize+seg]); err != nil {
+        payload := buf[frameHdrSize : frameHdrSize+seg]
+        if off > 0 {
+            copy(payload, buf[frameHdrSize+off:frameHdrSize+off+seg])
+        }
+        if pad := buf[frameHdrSize+seg : frameHdrSize+wireLen]; len(pad) > 0 {
+            clear(pad) // в канале только нули, никаких остатков чужих пакетов
+        }
+
+        if _, err := conn.Write(buf[:frameHdrSize+wireLen]); err != nil {
             log.Printf("Ошибка отправки в TCP: %v", err)
             return false
         }
@@ -310,7 +318,6 @@ func openTun(name string, isTAP bool, wantPersist bool) (*os.File, error) {
     return os.NewFile(uintptr(fd), kind+":"+name), nil
 }
 
-// setInterfaceMTU выставляет MTU интерфейса через SIOCSIFMTU.
 func setInterfaceMTU(name string, mtu int) error {
     fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, 0)
     if err != nil {
@@ -383,10 +390,10 @@ func runClient(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
     }
 }
 
-// Состояние сборщика пакетов.
+// Состояния сборщика пакетов.
 const (
-    stIdle     = iota // ждём FIRST
-    stAssemble        // копим куски до LAST
+    stIdle = iota // строго ждём FIRST
+    stAssemble    // копим куски до LAST
 )
 
 func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Config) {
@@ -395,10 +402,20 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
     const recvBufSize = 256 << 10
     r := bufio.NewReaderSize(tcpConn, recvBufSize)
 
-    frame := make([]byte, maxPacketSize)     // буфер для одиночных кусков
-    var acc []byte                            // ленивый аккумулятор для многокусковых пакетов
-    var hdr [chunkHdrSize]byte
+    frame := make([]byte, maxPacketSize) // сюда читается нагрузка текущего кадра (вместе с паддингом)
+    var acc []byte                       // ленивый аккумулятор для многокадровых пакетов
+    var hdr [frameHdrSize]byte
     mode := stIdle
+
+    // Троттлинг лога: при выключенном интерфейсе и высоком pps без него
+    // лог займёт весь вывод. Соединение при этих ошибках сознательно живёт дальше.
+    var lastDrop time.Time
+    writeTun := func(p []byte) {
+        if _, err := ifce.Write(p); err != nil && time.Since(lastDrop) >= dropLogPeriod {
+            lastDrop = time.Now()
+            log.Printf("Пакет (%d байт) отброшен: ошибка записи в TUN: %v (соединение сохранено)", len(p), err)
+        }
+    }
 
     defer func() {
         state.ClearIfCurrent(tcpConn)
@@ -406,16 +423,9 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
         log.Println("Обработчик соединения завершён")
     }()
 
-    writeToTun := func(p []byte) bool {
-        if _, err := ifce.Write(p); err != nil {
-            log.Printf("Ошибка записи в TUN: %v", err)
-            return false
-        }
-        return true
-    }
+    log.Printf("Туннель запущен. Кадры: [флаги u8][wireLen BE16][payLen BE16][данные+паддинг].")
 
-    log.Println("Туннель запущен. Фрейминг: [флаги u8][длина BE16][нагрузка].")
-    readLoop:
+readLoop:
     for {
         if _, err := io.ReadFull(r, hdr[:]); err != nil {
             if !errors.Is(err, io.EOF) {
@@ -424,33 +434,37 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
             break
         }
         flags := hdr[0]
-        flen := int(binary.BigEndian.Uint16(hdr[1:3]))
+        wireLen := int(binary.BigEndian.Uint16(hdr[1:3]))
+        payLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
-        if flen == 0 {
-            log.Println("Кадр нулевой длины — рассинхронизация протокола, разрыв")
+        // Валидация. Нарушение формата = рассинхронизация, лечится только
+        // переподключением. Эти проверки стоят вне switch, поэтому голый
+        // break здесь корректно покидает внешний цикл.
+        if flags&^validFlags != 0 {
+            log.Printf("Недопустимые биты флагов %#02x — разрыв", flags)
             break
         }
-        if flags &^ validFlags != 0 {
-            log.Printf("Недопустимые биты флагов %#02x — рассинхронизация или чужой клиент, разрыв", flags)
+        if wireLen == 0 || payLen == 0 || payLen > wireLen {
+            log.Printf("Некорректные длины (wire=%d, payload=%d) — рассинхронизация, разрыв", wireLen, payLen)
             break
         }
+
+        if _, err := io.ReadFull(r, frame[:wireLen]); err != nil {
+            log.Printf("Ошибка чтения тела кадра: %v", err)
+            break
+        }
+        payload := frame[:payLen] // паддинг в.tail отсекается самим payLen
 
         switch mode {
         case stIdle:
             if flags&flagFirst == 0 {
-                log.Printf("Кусок без FIRST в состоянии IDLE (len=%d, flags=%#02x) — разрыв", flen, flags)
-                break readLoop
+                log.Printf("Кадр без FIRST в состоянии IDLE (len=%d, flags=%#02x) — разрыв", payLen, flags)
+                break readLoop // метка обязательна: внутри switch голый break прервал бы только switch
             }
 
             if flags&flagLast != 0 {
-                // Быстрый путь: целый пакет одним куском, без сборки.
-                if _, err := io.ReadFull(r, frame[:flen]); err != nil {
-                    log.Printf("Ошибка чтения тела пакета: %v", err)
-                    return
-                }
-                if !writeToTun(frame[:flen]) {
-                    return
-                }
+                // Быстрый путь: целый пакет одним кадром, без сборки.
+                writeTun(payload)
                 continue
             }
 
@@ -458,12 +472,8 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
             if acc == nil {
                 acc = make([]byte, 0, maxPacketSize)
             }
-            acc = acc[:0]
-            acc = acc[:flen]
-            if _, err := io.ReadFull(r, acc); err != nil {
-                log.Printf("Ошибка чтения первого куска: %v", err)
-                return
-            }
+            acc = acc[:payLen]
+            copy(acc, payload)
             mode = stAssemble
 
         case stAssemble:
@@ -472,20 +482,15 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
                 return
             }
             base := len(acc)
-            if base+flen > maxPacketSize {
+            if base+payLen > maxPacketSize {
                 log.Printf("Собранный пакет превысил лимит %d байт — разрыв", maxPacketSize)
                 return
             }
-            acc = acc[:base+flen]
-            if _, err := io.ReadFull(r, acc[base:]); err != nil {
-                log.Printf("Ошибка чтения куска: %v", err)
-                return
-            }
+            acc = acc[:base+payLen]
+            copy(acc[base:], payload)
 
             if flags&flagLast != 0 {
-                if !writeToTun(acc) {
-                    return
-                }
+                writeTun(acc)
                 mode = stIdle
             }
         }
