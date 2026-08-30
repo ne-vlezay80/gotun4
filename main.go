@@ -27,11 +27,13 @@
 // slack-области, а НЕ шифрование: длины кадров и тайминги остаются открытыми.
 //
 // Шейпер (-delaytx/-jittertx, -delayrx/-jitterrx; -delay/-jitter — оба
-// направления сразу): задерживает выдачу каждого пакета (целиком, порядок
-// кусков внутри пакета сохранён) на delay + равномерный джиттер [0, jitter).
-// Шейперы TX и RX независимы (можно включить только одно направление).
-// Односторонняя задержка A->B = delaytx(A) + delayrx(B). Очередь каждого
-// шейпера ограничена по байтам (-shapebuf, на направление), переполнение =
+// направления сразу): задерживает выдачу каждого пакета на delay +
+// равномерный джиттер [0, jitter); пакет выдаётся целиком. Порядок пакетов
+// сохраняется (FIFO): дедлайн пакета не может оказаться раньше дедлайна
+// предыдущего — иначе при джиттере возможны перестановки. Шейперы TX и RX
+// независимы (можно включить только одно направление). Односторонняя
+// задержка A->B = delaytx(A) + delayrx(B). Очередь каждого шейпера
+// ограничена по байтам (-shapebuf, на направление), переполнение =
 // tail-drop. Учёт памяти ведётся по реальному размеру буферов очереди.
 //
 // Многопроцессорность: рантайм Go сам использует все ядра; флаг -procs
@@ -203,9 +205,23 @@ func newPadFiller(mode string) func([]byte) {
 
 // ---- шейпер: мин-куча по времени отправки + один таймер ----
 
+// shapeBufBytes переводит лимит очереди из МБ в байты. Считаем в int64
+// и клэмпим к максимуму int: на 32-битных платформах int 32-битный, и
+// 4096<<20 = 2^32 в нём не помещается — молча обратилось бы в 0 и
+// отключило бы учёт очереди (шейпер дропал бы всё).
+func shapeBufBytes(mb int) int {
+    const maxInt = int64(^uint(0) >> 1)
+    v := int64(mb) << 20
+    if v > maxInt {
+        return int(maxInt)
+    }
+    return int(v)
+}
+
 type schedItem struct {
     at  time.Time
-    pkt []byte // буфер из pktPool; владение переходит к out()
+    pkt []byte // буфер из pktPool (НЕ срезанный); владение переходит к out()
+    n   int    // размер пакета (payload) внутри pkt, как передан в Submit
     sz  int    // cap(pkt) — реальный удерживаемый объём (для учёта очереди)
 }
 
@@ -228,8 +244,10 @@ type shaper struct {
     out           func(pkt []byte, n int) // получает владение pkt, обязан вернуть его в пул
 
     mu      sync.Mutex
+    closed  bool
     q       schedQueue
     bytes   int
+    lastAt  time.Time // дедлайн последнего ПРИНЯТОГО пакета (FIFO при джиттере)
     wake    chan struct{}
     done    chan struct{}
     lastLog time.Time
@@ -254,11 +272,16 @@ func newShaper(delay, jitter time.Duration, maxBytes int, out func([]byte, int))
     return s
 }
 
-// Submit принимает владение pkt (буфер должен быть из pktPool).
+// Submit принимает владение pkt. Буфер должен быть из pktPool и НЕ срезан:
+// учёт очереди ведётся по cap(pkt), а пул переиспользует буферы целиком.
 // Никогда не блокирует: при переполнении — tail-drop пакета.
 // Учёт ведётся по cap(pkt): элемент очереди удерживает ВЕСЬ буфер из пула
 // (frameHdrSize+maxPacketSize), а не только полезную нагрузку — иначе
 // очередь из мелких пакетов незаметно съедает на порядки больше лимита.
+//
+// Дедлайн делается монотонным (не раньше дедлайна предыдущего принятого
+// пакета): иначе при джиттере пакет с малой случайной добавкой обогнал бы
+// предыдущий и порядок нарушился. При jitter == 0 клэмп — no-op.
 func (s *shaper) Submit(pkt []byte, n int) {
     at := time.Now().Add(s.delay)
     if s.jitter > 0 {
@@ -268,6 +291,11 @@ func (s *shaper) Submit(pkt []byte, n int) {
     sz := cap(pkt)
 
     s.mu.Lock()
+    if s.closed {
+        s.mu.Unlock()
+        putPkt(pkt)
+        return
+    }
     if s.bytes+sz > s.maxBytes {
         if time.Since(s.lastLog) >= dropLogPeriod {
             s.lastLog = time.Now()
@@ -278,8 +306,12 @@ func (s *shaper) Submit(pkt []byte, n int) {
         putPkt(pkt)
         return
     }
+    if at.Before(s.lastAt) {
+        at = s.lastAt
+    }
+    s.lastAt = at
     s.bytes += sz
-    heap.Push(&s.q, schedItem{at: at, pkt: pkt, sz: sz})
+    heap.Push(&s.q, schedItem{at: at, pkt: pkt, n: n, sz: sz})
     s.mu.Unlock()
 
     select {
@@ -340,6 +372,11 @@ func (s *shaper) run() {
 
         now := time.Now()
         for {
+            select {
+            case <-s.done:
+                return // после Close созревшие пакеты больше не выдаём
+            default:
+            }
             s.mu.Lock()
             if len(s.q) == 0 || s.q[0].at.After(now) {
                 s.mu.Unlock()
@@ -349,18 +386,12 @@ func (s *shaper) run() {
             s.bytes -= it.sz
             s.mu.Unlock()
 
-            s.out(it.pkt, it.n())
+            s.out(it.pkt, it.n)
         }
     }
 }
 
-func (it schedItem) n() int {
-    // размер полезной части: pkt[0:5] — заголовок лежит вне полезной
-    // нагрузки, поэтому границы считаем в out(); здесь n не храним,
-    // чтобы не плодить дублирование. См. комментарий в out-колбэках.
-    return len(it.pkt) - frameHdrSize
-}
-
+// drain возвращает оставшиеся в очереди буферы в пул (пакеты отбрасываются).
 func (s *shaper) drain() {
     s.mu.Lock()
     for _, it := range s.q {
@@ -371,7 +402,18 @@ func (s *shaper) drain() {
     s.mu.Unlock()
 }
 
-func (s *shaper) Close() { close(s.done) }
+// Close идемпотентен. После Close Submit лишь освобождает буферы,
+// выдача созревших пакетов прекращается, остаток очереди сливается в пул.
+func (s *shaper) Close() {
+    s.mu.Lock()
+    if s.closed {
+        s.mu.Unlock()
+        return
+    }
+    s.closed = true
+    s.mu.Unlock()
+    close(s.done)
+}
 
 // ---------------------------- main ----------------------------
 
@@ -526,7 +568,7 @@ func main() {
     // nil = выключен, прямой путь без копий.
     var txShape *shaper
     if cfg.DelayTX > 0 || cfg.JitterTX > 0 {
-        txShape = newShaper(cfg.DelayTX, cfg.JitterTX, cfg.ShapeBufMB<<20, func(pkt []byte, n int) {
+        txShape = newShaper(cfg.DelayTX, cfg.JitterTX, shapeBufBytes(cfg.ShapeBufMB), func(pkt []byte, n int) {
             c := state.Get()
             if c == nil {
                 putPkt(pkt)
@@ -569,6 +611,7 @@ func main() {
             }
 
             // Копия в пул: buf переиспользуется, а пакет полежит в очереди.
+            // Буфер передаётся НЕ срезанным — размер (n) шейпер хранит явно.
             pkt := getPkt()
             copy(pkt[frameHdrSize:frameHdrSize+n], buf[frameHdrSize:frameHdrSize+n])
             txShape.Submit(pkt, n)
@@ -748,9 +791,12 @@ func runServer(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
 
 func runClient(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
     bo := backoff{}
+    // Таймаут дозвона обязателен: без него на фильтрующих сетях (тихий
+    // drop SYN) Dial висит минутами и backoff не работает.
+    dialer := &net.Dialer{Timeout: 10 * time.Second}
     for {
         log.Printf("Клиент подключается к %s...", addr)
-        tcpConn, err := net.Dial("tcp", addr)
+        tcpConn, err := dialer.Dial("tcp", addr)
         if err != nil {
             log.Printf("Ошибка подключения: %v", err)
             time.Sleep(bo.next())
@@ -798,7 +844,7 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
     // nil = прямой путь.
     var rxShape *shaper
     if cfg.DelayRX > 0 || cfg.JitterRX > 0 {
-        rxShape = newShaper(cfg.DelayRX, cfg.JitterRX, cfg.ShapeBufMB<<20, func(pkt []byte, n int) {
+        rxShape = newShaper(cfg.DelayRX, cfg.JitterRX, shapeBufBytes(cfg.ShapeBufMB), func(pkt []byte, n int) {
             writeTun(pkt[:n])
             putPkt(pkt)
         })
@@ -819,7 +865,7 @@ func handleConnection(ifce *os.File, tcpConn net.Conn, state *SafeConn, cfg *Con
 
     defer func() {
         if rxShape != nil {
-            rxShape.Close() // упорядоченно сливает остаток очереди
+            rxShape.Close() // остаток очереди отбрасывается, буферы — в пул
         }
         state.ClearIfCurrent(tcpConn)
         tcpConn.Close()
@@ -919,10 +965,14 @@ func applyTCPSettings(conn net.Conn, cfg *Config) {
     tcp.SetNoDelay(cfg.NoDelay)
     if cfg.KeepAlive {
         // SetKeepAlivePeriod объявлен deprecated с Go 1.23.
+        // Count: 3 — смерть пира детектируется за ~Idle + 3*Interval (~60 с)
+        // вместо ~150 с с системным Count=9 (Linux). Для туннеля важно
+        // освобождать серверный слот без долгого зависания.
         tcp.SetKeepAliveConfig(net.KeepAliveConfig{
             Enable:   true,
             Idle:     15 * time.Second,
             Interval: 15 * time.Second,
+            Count:    3,
         })
     } else {
         tcp.SetKeepAlive(false)

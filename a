@@ -1,0 +1,14 @@
+client:
+./gotun4 -mode client -addr 192.168.1.4:42000 -tunmode tap -tun gotun0 -jitterrx 25ms -jittertx 50ms -chunkrx 1400 -chunktx 1200 -mtu 65520 -nodelay false
+server:
+./gotun4 -mode server -addr 192.168.1.4:42000 -tunmode tap -tun gotun0 -jitterrx 25ms -jittertx 50ms -chunkrx 1400 -chunktx 1200 -mtu 65520 -nodelay false
+
+mtu server and client 65520
+
+, seq 1670546:1671951, ack 1723150, win 3247, options [nop,nop,TS val 1663029614 ecr 1133359397], length 1405
+01:06:07.892028 92:be:0c:97:71:b8 > 7e:89:79:35:d7:49, ethertype IPv4 (0x0800), length 1471: 192.168.1.4.42000 > 192.168.1.3.42474: Flags [P.], seq 1671951:1673356, ack 1723150, win 3247, options [nop,nop,TS val 1663029614 ecr 1133359397], length 1405
+01:06:07.892037 92:be:0c:97:71:b8 > 7e:89:79:35:d7:49, ethertype IPv4 (0x0800), length 1471: 192.168.1.4.42000 > 192.168.1.3.42474: Flags [P.], seq 1673356:1674761, ack 1723150, win 3247, options [nop,nop,TS val 1663029614 ecr 1133359397], length 1405
+01:06:07.892170 7e:89:79:35:d7:49 > 92:be:0c:97:71:b8, ethertype IPv4 (0x0800), length 66: 192.168.1.3.42474 > 192.168.1.4.42000: Flags [.], ack 1674761, win 3194, options [nop,nop,TS val 1133359397 ecr 1663029614], length 0
+01:06:07.892189 92:be:0c:97:71:b8 > 7e:89:79:35:d7:49, ethertype IPv4 (0x0800), length 42216: 192.168.1.4.42000 > 192.168.1.3.42474: Flags [P.], seq 1674761:1716911, ack 1723150, win 3247, options [nop,nop,TS val 1663029614 ecr 1133359397], length 42150
+01:06:07.892224 7e:89:79:35:d7:49 > 92:be:0c:97:71:b8, ethertype IPv4 (0x0800), length 66: 192.168.1.3.42474 > 192.168.1.4.42000: Flags [.], ack 1716911, win 3194, options [nop,nop,TS val 1133359397 ecr 1663029614], length 0
+
