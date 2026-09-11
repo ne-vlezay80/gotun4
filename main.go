@@ -29,12 +29,31 @@
 // Шейпер (-delaytx/-jittertx, -delayrx/-jitterrx; -delay/-jitter — оба
 // направления сразу): задерживает выдачу каждого пакета на delay +
 // равномерный джиттер [0, jitter); пакет выдаётся целиком. Порядок пакетов
-// сохраняется (FIFO): дедлайн пакета не может оказаться раньше дедлайна
-// предыдущего — иначе при джиттере возможны перестановки. Шейперы TX и RX
-// независимы (можно включить только одно направление). Односторонняя
-// задержка A->B = delaytx(A) + delayrx(B). Очередь каждого шейпера
-// ограничена по байтам (-shapebuf, на направление), переполнение =
+// строго сохраняется (FIFO): дедлайн пакета не бывает раньше дедлайна
+// предыдущего, а при равных дедлайнах порядок фиксируется порядковым
+// номером приёма — перестановок нет даже при клэмпе и грубых часах.
+// Шейперы TX и RX независимы (можно включить только одно направление).
+// Односторонняя задержка A->B = delaytx(A) + delayrx(B). Очередь каждого
+// шейпера ограничена по байтам (-shapebuf, на направление), переполнение =
 // tail-drop. Учёт памяти ведётся по реальному размеру буферов очереди.
+//
+// Судьба очередей шейпера при обрыве TCP: очередь RX (от пира) гибнет
+// вместе с соединением; очередь TX (от TUN) переживает обрыв и выдаётся
+// в следующее соединение. Для IP-туннеля оба поведения корректны.
+//
+// Сервер обслуживает одного клиента: слот занят до смерти старого
+// соединения (при полной тишине детектится keepalive, ~60 с); новые
+// подключения в это время отклоняются.
+//
+// SOCKS5-прокси (-proxy, только для -mode client): исходящие подключения
+// идут через прокси. Формат: host:port либо socks5://[user:pass@]host:port
+// (socks5h:// — синоним). user:pass со спецсимволами — в percent-encoding.
+// Аутентификация по логину/паролю (RFC 1929) включается автоматически при
+// наличии user:pass. Имена целей локально НЕ резолвятся: в CONNECT уходит
+// домен, его разрешает прокси (семантика socks5h); IP подставляются байтами.
+// Рукопожатие ограничено таймаутом дозвона; после успеха соединение —
+// обычный транспорт кадров. В режиме server -proxy игнорируется
+// (с предупреждением). Опечатка в -proxy = отказ старта, а не тихий обход.
 //
 // Многопроцессорность: рантайм Go сам использует все ядра; флаг -procs
 // позволяет лишь явно ограничить параллелизм (GOMAXPROCS).
@@ -55,12 +74,15 @@ import (
     "encoding/binary"
     "errors"
     "flag"
+    "fmt"
     "io"
     "log"
     mrand "math/rand/v2"
     "net"
+    "net/url"
     "os"
     "runtime"
+    "strconv"
     "strings"
     "sync"
     "syscall"
@@ -83,6 +105,9 @@ const (
     maxPacketSize = 65535
     dropLogPeriod = 10 * time.Second
     maxShapeBufMB = 4096 // защита от переполнения при абсурдных значениях -shapebuf
+
+    // Общий таймаут дозвона; он же ограничивает всю фазу рукопожатия SOCKS5.
+    clientDialTimeout = 10 * time.Second
 )
 
 // ifReq повторяет struct ifreq ядра Linux: sizeof = 40 байт на LP64.
@@ -114,6 +139,10 @@ type Config struct {
 
     ShapeBufMB int
     PadMode    string // "zero" | "random"
+
+    // Proxy != nil — исходящие подключения клиента через SOCKS5.
+    // Заполняется только для -mode client (см. -proxy).
+    Proxy *url.URL
 }
 
 type SafeConn struct {
@@ -181,12 +210,12 @@ func putPkt(b []byte) { pktPool.Put(b) }
 // crypto/rand: он криптостойкий и при этом быстрый (~ГБ/с), так что
 // стоимость сопоставима с memset и пригодна для каждого кадра.
 // Экземпляр используется единственной горутиной-отправителем.
-func newPadFiller(mode string) func([]byte) {
+func newPadFiller(mode string) (func([]byte), error) {
     switch mode {
     case "random":
         var seed [32]byte
         if _, err := crand.Read(seed[:]); err != nil {
-            log.Fatalf("Критично: crypto/rand недоступен: %v", err)
+            return nil, fmt.Errorf("crypto/rand недоступен: %w", err)
         }
         rng := mrand.NewChaCha8(seed)
         return func(b []byte) {
@@ -197,9 +226,9 @@ func newPadFiller(mode string) func([]byte) {
                 }
                 b = b[n:]
             }
-        }
+        }, nil
     default: // "zero"
-        return func(b []byte) { clear(b) }
+        return func(b []byte) { clear(b) }, nil
     }
 }
 
@@ -220,6 +249,7 @@ func shapeBufBytes(mb int) int {
 
 type schedItem struct {
     at  time.Time
+    seq uint64 // порядок приёма: при равных `at` гарантирует строгий FIFO
     pkt []byte // буфер из pktPool (НЕ срезанный); владение переходит к out()
     n   int    // размер пакета (payload) внутри pkt, как передан в Submit
     sz  int    // cap(pkt) — реальный удерживаемый объём (для учёта очереди)
@@ -227,10 +257,20 @@ type schedItem struct {
 
 type schedQueue []schedItem
 
-func (q schedQueue) Len() int           { return len(q) }
-func (q schedQueue) Less(i, j int) bool { return q[i].at.Before(q[j].at) }
-func (q schedQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
-func (q *schedQueue) Push(x any)        { *q = append(*q, x.(schedItem)) }
+func (q schedQueue) Len() int { return len(q) }
+
+// Less с тай-брейком по seq: heap.Pop среди равных ключей иначе не даёт
+// НИКАКИХ гарантий порядка, а клэмп дедлайнов по lastAt порождает равные
+// `at` штатно (при джиттере и на часах с грубым разрешением).
+func (q schedQueue) Less(i, j int) bool {
+    if q[i].at.Equal(q[j].at) {
+        return q[i].seq < q[j].seq
+    }
+    return q[i].at.Before(q[j].at)
+}
+
+func (q schedQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
+func (q *schedQueue) Push(x any)   { *q = append(*q, x.(schedItem)) }
 func (q *schedQueue) Pop() any {
     old := *q
     it := old[len(old)-1]
@@ -248,6 +288,7 @@ type shaper struct {
     q       schedQueue
     bytes   int
     lastAt  time.Time // дедлайн последнего ПРИНЯТОГО пакета (FIFO при джиттере)
+    seq     uint64    // монотонный счётчик принятых пакетов (тай-брейк кучи)
     wake    chan struct{}
     done    chan struct{}
     lastLog time.Time
@@ -281,7 +322,8 @@ func newShaper(delay, jitter time.Duration, maxBytes int, out func([]byte, int))
 //
 // Дедлайн делается монотонным (не раньше дедлайна предыдущего принятого
 // пакета): иначе при джиттере пакет с малой случайной добавкой обогнал бы
-// предыдущий и порядок нарушился. При jitter == 0 клэмп — no-op.
+// предыдущий и порядок нарушился. При jitter == 0 клэмп — no-op. При равных
+// дедлайнах порядок выдачи фиксируется seq — строго в порядке приёма.
 func (s *shaper) Submit(pkt []byte, n int) {
     at := time.Now().Add(s.delay)
     if s.jitter > 0 {
@@ -311,7 +353,8 @@ func (s *shaper) Submit(pkt []byte, n int) {
     }
     s.lastAt = at
     s.bytes += sz
-    heap.Push(&s.q, schedItem{at: at, pkt: pkt, n: n, sz: sz})
+    s.seq++
+    heap.Push(&s.q, schedItem{at: at, seq: s.seq, pkt: pkt, n: n, sz: sz})
     s.mu.Unlock()
 
     select {
@@ -418,10 +461,18 @@ func (s *shaper) Close() {
 // ---------------------------- main ----------------------------
 
 func main() {
+    os.Exit(run())
+}
+
+// run возвращает код выхода. Ошибки завершения возвращаются наверх, а не
+// завершают процесс через log.Fatalf: os.Exit обходит defer, и закрытие
+// TUN-файла (и любое будущее освобождение ресурсов) не выполнялось бы.
+func run() int {
     mode := flag.String("mode", "client", "Режим работы: client или server")
     tunName := flag.String("tun", "tun0", "Имя TUN интерфейса")
     tunMode := flag.String("tunmode", "tun", "Режим TUN интерфейса (tun/tap)")
     addr := flag.String("addr", "127.0.0.1:1080", "Адрес подключения/прослушивания")
+    proxy := flag.String("proxy", "", "SOCKS5-прокси для исходящих подключений (client): host:port или socks5://user:pass@host:port")
     mtu := flag.Int("mtu", 1400, "MTU интерфейса (<=0 — не менять)")
     persist := flag.Bool("persist", false, "Оставлять интерфейс после выхода (TUNSETPERSIST)")
 
@@ -521,9 +572,37 @@ func main() {
         log.Printf("GOMAXPROCS: %d -> %d", prev, *procs)
     }
 
+    // SOCKS5-прокси валидируем на старте: молча уйти напрямую из-за опечатки
+    // недопустимо — это изменение маршрутизации трафика, а не косметика.
+    if *proxy != "" {
+        switch *mode {
+        case "server":
+            log.Printf("Предупреждение: -proxy игнорируется в режиме server (прокси применяется только к исходящим подключениям клиента)")
+        case "client":
+            u, err := parseProxyURL(*proxy)
+            if err != nil {
+                log.Printf("Ошибка: некорректный -proxy %q: %v", *proxy, err)
+                return 1
+            }
+            cfg.Proxy = u
+            authNote := "без аутентификации"
+            if u.User != nil && u.User.Username() != "" {
+                authNote = "с аутентификацией (RFC 1929)"
+            }
+            log.Printf("Исходящие подключения через SOCKS5 %s (%s); имена целей резолвит прокси", u.Host, authNote)
+        }
+    }
+
+    padFill, err := newPadFiller(cfg.PadMode)
+    if err != nil {
+        log.Printf("Критично: %v", err)
+        return 1
+    }
+
     ifce, ifName, err := openTun(*tunName, tm == "tap", *persist)
     if err != nil {
-        log.Fatalf("Ошибка создания TUN: %v", err)
+        log.Printf("Ошибка создания TUN: %v", err)
+        return 1
     }
     defer ifce.Close()
 
@@ -551,7 +630,6 @@ func main() {
     }
 
     state := &SafeConn{}
-    padFill := newPadFiller(cfg.PadMode)
 
     // Единая точка отправки в TCP (вызывается ТОЛЬКО из одной горутины:
     // либо цикл чтения TUN, либо диспетчер шейпера — одновременно никогда).
@@ -581,6 +659,7 @@ func main() {
     // Поток отправки (TUN -> шейпер -> TCP).
     go func() {
         buf := make([]byte, frameHdrSize+maxPacketSize)
+        var lastErrLog time.Time
         for {
             // n <= maxPacketSize гарантировано размером среза в Read.
             n, err := ifce.Read(buf[frameHdrSize:])
@@ -589,7 +668,14 @@ func main() {
                 if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
                     return
                 }
-                time.Sleep(10 * time.Millisecond) // против горячего цикла
+                // Интерфейс исчез/упал: это не разрыв туннеля, но и крутить
+                // горячий цикл молча нельзя — лог не чаще dropLogPeriod
+                // и пауза против busy-loop.
+                if time.Since(lastErrLog) >= dropLogPeriod {
+                    lastErrLog = time.Now()
+                    log.Printf("Ошибка чтения TUN: %v (продолжаю)", err)
+                }
+                time.Sleep(10 * time.Millisecond)
                 continue
             }
             if n == 0 {
@@ -620,12 +706,17 @@ func main() {
 
     switch *mode {
     case "server":
-        runServer(ifce, *addr, state, cfg)
+        if err := runServer(ifce, *addr, state, cfg); err != nil {
+            log.Printf("Ошибка запуска сервера: %v", err)
+            return 1
+        }
     case "client":
         runClient(ifce, *addr, state, cfg)
     default:
-        log.Fatal("Неизвестный режим: ", *mode)
+        log.Printf("Неизвестный режим: %s", *mode)
+        return 1
     }
+    return 0
 }
 
 // emitFrames пишет пакет длиной n (payload лежит в buf с offset frameHdrSize)
@@ -637,6 +728,11 @@ func main() {
 // Последний кусок тоже добивается до полного размера.
 // chunk <= 0: wireLen == payLen, без дробления и без паддинга.
 func emitFrames(conn net.Conn, buf []byte, n, chunk int, fill func([]byte)) bool {
+    // Пакет нулевой длины в этом формате непредставим (приёмник считает
+    // payLen == 0 рассинхроном и рвёт соединение) — просто игнорируем.
+    if n <= 0 {
+        return true
+    }
     fixed := chunk > 0
     for off := 0; off < n; {
         seg := n - off
@@ -760,10 +856,223 @@ func setInterfaceMTU(name string, mtu int) error {
     return nil
 }
 
-func runServer(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
+// ---------------------------- SOCKS5 ----------------------------
+
+// SOCKS5 (RFC 1928) + аутентификация логин/пароль (RFC 1929).
+// Реализовано на stdlib сознательно: зависимость от golang.org/x/net
+// ради ~50 строк протокола не нужна.
+const (
+    socksVer5       = 0x05
+    socksCmdConnect = 0x01
+
+    socksAuthNone     = 0x00
+    socksAuthUserPass = 0x02
+    socksAuthBad      = 0xFF // прокси не выбрал ни один предложенный метод
+
+    socksAtypIPv4   = 0x01
+    socksAtypDomain = 0x03
+    socksAtypIPv6   = 0x04
+
+    socksRepSuccess = 0x00
+)
+
+var socksRepText = [...]string{
+    "успех",
+    "общий сбой SOCKS-сервера",
+    "соединение запрещено правилами",
+    "сеть недостижима",
+    "хост недостижим",
+    "отказ в соединении",
+    "истёк TTL",
+    "команда не поддерживается",
+    "тип адреса не поддерживается",
+}
+
+// parseProxyURL разбирает значение -proxy: голый "host:port" трактуется
+// как socks5, полная форма — "socks5://[user:pass@]host:port" (процентное
+// кодирование в user:pass обрабатывается url.Parse). Схема socks5h —
+// синоним socks5: имена целей в обоих случаях резолвит прокси.
+func parseProxyURL(s string) (*url.URL, error) {
+    if !strings.Contains(s, "://") {
+        s = "socks5://" + s
+    }
+    u, err := url.Parse(s)
+    if err != nil {
+        return nil, err
+    }
+    switch u.Scheme {
+    case "socks5", "socks5h":
+    default:
+        return nil, fmt.Errorf("схема %q не поддерживается (ожидается socks5)", u.Scheme)
+    }
+    if u.Host == "" {
+        return nil, errors.New("пустой адрес прокси")
+    }
+    if p := u.Path; p != "" && p != "/" {
+        return nil, fmt.Errorf("лишняя часть пути %q в адресе прокси", p)
+    }
+    return u, nil
+}
+
+// dialSOCKS5 устанавливает TCP-соединение с SOCKS5-прокси и запрашивает
+// CONNECT к target ("host:port"). На всю фазу рукопожатия ставится
+// дедлайн timeout; после успеха он снимается — соединение становится
+// обычным транспортом кадров и живёт неограниченно долго.
+func dialSOCKS5(proxy, target string, timeout time.Duration, username, password string, haveAuth bool) (net.Conn, error) {
+    d := &net.Dialer{Timeout: timeout}
+    conn, err := d.Dial("tcp", proxy)
+    if err != nil {
+        return nil, fmt.Errorf("подключение к прокси %s: %w", proxy, err)
+    }
+    conn.SetDeadline(time.Now().Add(timeout))
+    if err := socksHandshake(conn, target, username, password, haveAuth); err != nil {
+        conn.Close()
+        return nil, err
+    }
+    conn.SetDeadline(time.Time{})
+    return conn, nil
+}
+
+func socksHandshake(conn net.Conn, target, username, password string, haveAuth bool) error {
+    // Цель валидируем до приветствия — нечего нагружать прокси мусором.
+    host, portStr, err := net.SplitHostPort(target)
+    if err != nil {
+        return fmt.Errorf("адрес цели %q: %w", target, err)
+    }
+    port, err := strconv.Atoi(portStr)
+    if err != nil || port <= 0 || port > 65535 {
+        return fmt.Errorf("некорректный порт цели %q", portStr)
+    }
+
+    // 1) Приветствие: версия + список поддерживаемых методов.
+    methods := []byte{socksAuthNone}
+    if haveAuth {
+        methods = append(methods, socksAuthUserPass)
+    }
+    greeting := make([]byte, 0, 2+len(methods))
+    greeting = append(greeting, socksVer5, byte(len(methods)))
+    greeting = append(greeting, methods...)
+    if _, err := conn.Write(greeting); err != nil {
+        return fmt.Errorf("приветствие прокси: %w", err)
+    }
+
+    resp := make([]byte, 2)
+    if _, err := io.ReadFull(conn, resp); err != nil {
+        return fmt.Errorf("ответ на приветствие: %w", err)
+    }
+    if resp[0] != socksVer5 {
+        return fmt.Errorf("это не SOCKS5 (версия ответа %#02x)", resp[0])
+    }
+    switch resp[1] {
+    case socksAuthNone:
+        // ок, без аутентификации
+    case socksAuthUserPass:
+        if !haveAuth {
+            return errors.New("прокси требует логин/пароль, а в -proxy учётные данные не указаны (socks5://user:pass@host:port)")
+        }
+        if err := socksAuth(conn, username, password); err != nil {
+            return err
+        }
+    case socksAuthBad:
+        return errors.New("прокси не принял ни один из предложенных методов аутентификации")
+    default:
+        return fmt.Errorf("прокси выбрал неизвестный метод %#02x", resp[1])
+    }
+
+    // 2) CONNECT к цели. IP подставляется байтами (IPv4/IPv6), имя —
+    // доменным ATYP: резолвить будет прокси (семантика socks5h).
+    req := make([]byte, 0, 7+len(host))
+    req = append(req, socksVer5, socksCmdConnect, 0x00)
+    if ip := net.ParseIP(host); ip != nil {
+        if v4 := ip.To4(); v4 != nil {
+            req = append(req, socksAtypIPv4)
+            req = append(req, v4...)
+        } else {
+            req = append(req, socksAtypIPv6)
+            req = append(req, ip.To16()...)
+        }
+    } else {
+        if host == "" || len(host) > 255 {
+            return fmt.Errorf("имя цели %q непригодно (пустое или длиннее 255 байт)", host)
+        }
+        req = append(req, socksAtypDomain, byte(len(host)))
+        req = append(req, host...)
+    }
+    req = append(req, byte(port>>8), byte(port))
+    if _, err := conn.Write(req); err != nil {
+        return fmt.Errorf("запрос CONNECT: %w", err)
+    }
+
+    // 3) Ответ: [ver rep rsv atyp][адрес][порт BE16]. Адрес читаем и
+    // выбрасываем — транспорт уже установлен, BND.ADDR нам не нужен.
+    head := make([]byte, 4)
+    if _, err := io.ReadFull(conn, head); err != nil {
+        return fmt.Errorf("ответ на CONNECT: %w", err)
+    }
+    if head[0] != socksVer5 {
+        return fmt.Errorf("CONNECT: неожиданная версия ответа %#02x", head[0])
+    }
+    if head[1] != socksRepSuccess {
+        msg := ""
+        if int(head[1]) < len(socksRepText) {
+            msg = ": " + socksRepText[head[1]]
+        }
+        return fmt.Errorf("прокси отклонил CONNECT (код %d%s)", head[1], msg)
+    }
+    var addrLen int
+    switch head[3] {
+    case socksAtypIPv4:
+        addrLen = 4
+    case socksAtypDomain:
+        var l [1]byte
+        if _, err := io.ReadFull(conn, l[:]); err != nil {
+            return fmt.Errorf("CONNECT (длина имени): %w", err)
+        }
+        addrLen = int(l[0])
+    case socksAtypIPv6:
+        addrLen = 16
+    default:
+        return fmt.Errorf("CONNECT: неизвестный тип адреса %#02x", head[3])
+    }
+    tail := make([]byte, addrLen+2) // адрес + порт
+    if _, err := io.ReadFull(conn, tail); err != nil {
+        return fmt.Errorf("CONNECT (адрес/порт): %w", err)
+    }
+    return nil
+}
+
+// socksAuth — subnegotiation логин/пароль (RFC 1929).
+func socksAuth(conn net.Conn, username, password string) error {
+    if len(username) > 255 || len(password) > 255 {
+        return errors.New("логин/пароль прокси длиннее 255 байт")
+    }
+    req := make([]byte, 0, 3+len(username)+len(password))
+    req = append(req, 0x01, byte(len(username)))
+    req = append(req, username...)
+    req = append(req, byte(len(password)))
+    req = append(req, password...)
+    if _, err := conn.Write(req); err != nil {
+        return fmt.Errorf("аутентификация на прокси: %w", err)
+    }
+    resp := make([]byte, 2)
+    if _, err := io.ReadFull(conn, resp); err != nil {
+        return fmt.Errorf("ответ аутентификации: %w", err)
+    }
+    if resp[0] != 0x01 {
+        return fmt.Errorf("неожиданная версия subnegotiation %#02x", resp[0])
+    }
+    if resp[1] != 0x00 {
+        return errors.New("прокси отклонил логин/пароль")
+    }
+    return nil
+}
+
+// ---------------------------- server/client ----------------------------
+
+func runServer(ifce *os.File, addr string, state *SafeConn, cfg *Config) error {
     listener, err := net.Listen("tcp", addr)
     if err != nil {
-        log.Fatalf("Ошибка запуска сервера: %v", err)
+        return err
     }
     defer listener.Close()
 
@@ -793,10 +1102,25 @@ func runClient(ifce *os.File, addr string, state *SafeConn, cfg *Config) {
     bo := backoff{}
     // Таймаут дозвона обязателен: без него на фильтрующих сетях (тихий
     // drop SYN) Dial висит минутами и backoff не работает.
-    dialer := &net.Dialer{Timeout: 10 * time.Second}
+    dialer := &net.Dialer{Timeout: clientDialTimeout}
     for {
         log.Printf("Клиент подключается к %s...", addr)
-        tcpConn, err := dialer.Dial("tcp", addr)
+
+        var tcpConn net.Conn
+        var err error
+        if cfg.Proxy != nil {
+            // Учётные данные из URL; percent-encoding уже раскодирован
+            // url.Parse. Пустое имя пользователя считаем отсутствием auth.
+            user, pass := "", ""
+            haveAuth := cfg.Proxy.User != nil && cfg.Proxy.User.Username() != ""
+            if haveAuth {
+                user = cfg.Proxy.User.Username()
+                pass, _ = cfg.Proxy.User.Password()
+            }
+            tcpConn, err = dialSOCKS5(cfg.Proxy.Host, addr, clientDialTimeout, user, pass, haveAuth)
+        } else {
+            tcpConn, err = dialer.Dial("tcp", addr)
+        }
         if err != nil {
             log.Printf("Ошибка подключения: %v", err)
             time.Sleep(bo.next())
@@ -937,14 +1261,15 @@ readLoop:
             mode = stAssemble
 
         case stAssemble:
+            // Все нарушения — единый выход через break readLoop.
             if flags&flagFirst != 0 {
                 log.Println("Новый FIRST посреди незавершённого пакета — разрыв")
-                return
+                break readLoop
             }
             base := len(acc)
             if base+payLen > maxPacketSize {
                 log.Printf("Собранный пакет превысил лимит %d байт — разрыв", maxPacketSize)
-                return
+                break readLoop
             }
             acc = acc[:base+payLen]
             copy(acc[base:], payload)
@@ -962,25 +1287,36 @@ func applyTCPSettings(conn net.Conn, cfg *Config) {
     if !ok {
         return
     }
-    tcp.SetNoDelay(cfg.NoDelay)
+    // Ошибки установки опций не фатальны, но молчать о них нельзя:
+    // неприменившийся SetReadBuffer (малый rmem_max) выглядит потом
+    // как необъяснимые потери на высоких скоростях.
+    if err := tcp.SetNoDelay(cfg.NoDelay); err != nil {
+        log.Printf("TCP_NODELAY=%v: %v", cfg.NoDelay, err)
+    }
     if cfg.KeepAlive {
         // SetKeepAlivePeriod объявлен deprecated с Go 1.23.
         // Count: 3 — смерть пира детектируется за ~Idle + 3*Interval (~60 с)
         // вместо ~150 с с системным Count=9 (Linux). Для туннеля важно
         // освобождать серверный слот без долгого зависания.
-        tcp.SetKeepAliveConfig(net.KeepAliveConfig{
+        if err := tcp.SetKeepAliveConfig(net.KeepAliveConfig{
             Enable:   true,
             Idle:     15 * time.Second,
             Interval: 15 * time.Second,
             Count:    3,
-        })
-    } else {
-        tcp.SetKeepAlive(false)
+        }); err != nil {
+            log.Printf("keepalive: %v", err)
+        }
+    } else if err := tcp.SetKeepAlive(false); err != nil {
+        log.Printf("keepalive off: %v", err)
     }
     if mb := cfg.RxBufferMB * 1024 * 1024; mb > 0 {
-        tcp.SetReadBuffer(mb)
+        if err := tcp.SetReadBuffer(mb); err != nil {
+            log.Printf("буфер RX %d МБ не применён: %v", cfg.RxBufferMB, err)
+        }
     }
     if mb := cfg.TxBufferMB * 1024 * 1024; mb > 0 {
-        tcp.SetWriteBuffer(mb)
+        if err := tcp.SetWriteBuffer(mb); err != nil {
+            log.Printf("буфер TX %d МБ не применён: %v", cfg.TxBufferMB, err)
+        }
     }
 }
